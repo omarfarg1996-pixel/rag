@@ -1,0 +1,339 @@
+version: '3.8'
+
+# Commerce AI Core - Development Docker Compose
+# This file orchestrates all services for local development
+
+services:
+  # ============================================
+  # PostgreSQL Database
+  # ============================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: commerce-ai-core-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: commerce_user
+      POSTGRES_PASSWORD: commerce_pass
+      POSTGRES_DB: commerce_ai_core
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/extensions.sql:/docker-entrypoint-initdb.d/extensions.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U commerce_user -d commerce_ai_core"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - commerce-network
+
+  # ============================================
+  # Redis Cache & Message Broker
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: commerce-ai-core-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - commerce-network
+
+  # ============================================
+  # Temporal Workflow Engine
+  # ============================================
+  temporal:
+    image: temporalio/auto-setup:1.23
+    container_name: commerce-ai-core-temporal
+    restart: unless-stopped
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=commerce_user
+      - POSTGRES_PWD=commerce_pass
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/dynamicconfig/development.yaml
+    volumes:
+      - ./infra/temporal/dynamicconfig/development.yaml:/etc/temporal/dynamicconfig/development.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8233/api/v1/namespaces/default"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - commerce-network
+
+  temporal-ui:
+    image: temporalio/ui:2.27.0
+    container_name: commerce-ai-core-temporal-ui
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+    networks:
+      - commerce-network
+
+  # ============================================
+  # Qdrant Vector Database
+  # ============================================
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: commerce-ai-core-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - ./infra/qdrant/config.yaml:/qdrant/config/production.yaml
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - commerce-network
+
+  # ============================================
+  # MinIO Object Storage (S3-compatible)
+  # ============================================
+  minio:
+    image: minio/minio:RELEASE.2024-01-01T16-36-07Z
+    container_name: commerce-ai-core-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - commerce-network
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-01-01T16-36-07Z
+    container_name: commerce-ai-core-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/commerce-ai-core --ignore-existing;
+      /usr/bin/mc policy set public myminio/commerce-ai-core;
+      exit 0;
+      "
+    networks:
+      - commerce-network
+
+  # ============================================
+  # API Service
+  # ============================================
+  api:
+    build:
+      context: .
+      dockerfile: infra/docker/api.Dockerfile
+    container_name: commerce-ai-core-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://commerce_user:commerce_pass@postgres:5432/commerce_ai_core
+      REDIS_URL: redis://redis:6379/0
+      TEMPORAL_HOST: temporal
+      TEMPORAL_PORT: 7233
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ./apps/api:/app/apps/api
+      - ./packages:/app/packages
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - commerce-network
+
+  # ============================================
+  # Worker Service
+  # ============================================
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    container_name: commerce-ai-core-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://commerce_user:commerce_pass@postgres:5432/commerce_ai_core
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./apps/worker:/app/apps/worker
+      - ./packages:/app/packages
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - commerce-network
+
+  # ============================================
+  # Workflow Worker Service
+  # ============================================
+  workflow-worker:
+    build:
+      context: .
+      dockerfile: infra/docker/workflow-worker.Dockerfile
+    container_name: commerce-ai-core-workflow-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://commerce_user:commerce_pass@postgres:5432/commerce_ai_core
+      REDIS_URL: redis://redis:6379/0
+      TEMPORAL_HOST: temporal
+      TEMPORAL_PORT: 7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: commerce-ai-core-tasks
+    volumes:
+      - ./apps/workflow_worker:/app/apps/workflow_worker
+      - ./packages:/app/packages
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    networks:
+      - commerce-network
+
+  # ============================================
+  # AI Engine Service
+  # ============================================
+  ai-engine:
+    build:
+      context: .
+      dockerfile: infra/docker/ai-engine.Dockerfile
+    container_name: commerce-ai-core-ai-engine
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql://commerce_user:commerce_pass@postgres:5432/commerce_ai_core
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - ./apps/ai_engine:/app/apps/ai_engine
+      - ./packages:/app/packages
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - commerce-network
+
+  # ============================================
+  # Webhook Gateway Service
+  # ============================================
+  webhook-gateway:
+    build:
+      context: .
+      dockerfile: infra/docker/webhook-gateway.Dockerfile
+    container_name: commerce-ai-core-webhook-gateway
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      DATABASE_URL: postgresql://commerce_user:commerce_pass@postgres:5432/commerce_ai_core
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./apps/webhook_gateway:/app/apps/webhook_gateway
+      - ./packages:/app/packages
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - commerce-network
+
+  # ============================================
+  # Web Frontend
+  # ============================================
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+      target: development
+    container_name: commerce-ai-core-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_APP_NAME: Commerce AI Core
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+    depends_on:
+      - api
+    networks:
+      - commerce-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  commerce-network:
+    driver: bridge
