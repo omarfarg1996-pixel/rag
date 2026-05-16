@@ -1,3 +1,29 @@
+ بناء-commerce-ai-core-63014
+# Compiled and build artifacts
+*.pyc
+__pycache__/
+*.o
+*.obj
+dist/
+build/
+target/
+
+# Dependencies
+.venv/
+venv/
+node_modules/
+.mypy_cache/
+.pytest_cache/
+.coverage
+coverage/
+htmlcov/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+=======
 ```
 # Dependencies
 node_modules/
@@ -46,10 +72,14 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+ main
 # Environment
 .env
 .env.local
+ بناء-commerce-ai-core-63014
+*.env.*
+
+# Editors
 .env.*
 
 # Docker
@@ -57,10 +87,20 @@ wheels/
 .DS_Store
 
 # IDE
+ main
 .vscode/
 .idea/
 *.swp
 *.swo
+ بناء-commerce-ai-core-63014
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Documentation and scripts - only ignore build artifacts, not source
+commerce-ai-core/docs/
+commerce-ai-core/scripts/
 *.tmp
 
 # Logs
@@ -72,3 +112,4 @@ build/
 coverage/
 .nyc_output
 ```
+ main
